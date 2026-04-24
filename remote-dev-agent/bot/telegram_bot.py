@@ -3,13 +3,24 @@ import json
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from config.settings import settings
+from config.settings import settings, WORKSPACE_DIR
 from monitor.system_monitor import format_system_status
 from reasoning.translator import translate_prompt_to_sessions
 from agent.execution_engine import executor
 from utils import execution_logger
 
 logger = logging.getLogger(__name__)
+
+def escape_markdown(text: str) -> str:
+    """Helper to escape markdown characters that cause Telegram API errors."""
+    if not text:
+        return ""
+    # Characters to escape in Markdown (V1)
+    # _ * [ `
+    chars = ['_', '*', '[', '`']
+    for char in chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 
 # Global state to track sessions
 app_state = {
@@ -24,7 +35,10 @@ app_state = {
 def is_allowed(update: Update) -> bool:
     """Checks if the user is authorized."""
     user_id = str(update.effective_user.id)
-    return user_id == settings.ALLOWED_USER_ID
+    allowed = user_id == settings.ALLOWED_USER_ID
+    if not allowed:
+        logger.warning(f"Unauthorized access attempt by user ID: {user_id}")
+    return allowed
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -38,15 +52,40 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = format_system_status()
     await update.message.reply_text(status_msg)
 
+async def stop_workflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels the current development workflow."""
+    if not is_allowed(update):
+        return
+    
+    if not app_state["sessions"]:
+        await update.message.reply_text("No active workflow to stop.")
+        return
+        
+    app_state["sessions"] = []
+    app_state["current_session_index"] = 0
+    app_state["completed_sessions"] = []
+    app_state["failed_sessions"] = []
+    
+    await update.message.reply_text("🛑 Development workflow cancelled and state reset. You can now send a new master prompt.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     
+    # Check if a session is already in progress
+    if app_state["sessions"] and app_state["current_session_index"] < len(app_state["sessions"]):
+        await update.message.reply_text(
+            "⚠️ A development workflow is already in progress.\n\n"
+            "• Use the **YES/SKIP/STOP** buttons to control it.\n"
+            "• Send `/stop` to cancel it and start fresh."
+        )
+        return
+        
     prompt = update.message.text
     await update.message.reply_text("🧠 Analyzing master prompt and building sessions... (This may take a minute)")
     
-    # Run translator
-    sessions = translate_prompt_to_sessions(prompt)
+    # Run translator in a thread to avoid blocking the bot
+    sessions = await asyncio.to_thread(translate_prompt_to_sessions, prompt)
     
     if not sessions:
         await update.message.reply_text("Failed to generate sessions or no tasks found. Please try rephrasing.")
@@ -55,6 +94,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app_state["sessions"] = sessions
     app_state["current_session_index"] = 0
     app_state["completed_sessions"] = []
+    app_state["failed_sessions"] = []
     
     summary = f"Generated {len(sessions)} sessions.\n"
     for s in sessions:
@@ -117,12 +157,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Create a callback for safety alerts during execution
             safety_messages = []
+            loop = asyncio.get_running_loop()
+            
             def safety_alert(msg):
                 safety_messages.append(msg)
                 logger.warning(f"SAFETY ALERT: {msg}")
+                # Real-time notification to user
+                asyncio.run_coroutine_threadsafe(
+                    query.message.reply_text(f"⚠️ **SAFETY ALERT**: {msg}"),
+                    loop
+                )
             
-            # Execute the session with error handling and retry support
-            report = executor.execute_session(session, safety_callback=safety_alert)
+            # Execute the session in a separate thread to keep bot responsive
+            report = await asyncio.to_thread(executor.execute_session, session, safety_callback=safety_alert)
             
             # Store completed session
             app_state["completed_sessions"].append(report)
@@ -130,9 +177,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send detailed report
             await send_session_report(query, report, safety_messages)
             
-            # Move to next session
-            app_state["current_session_index"] += 1
-            await prompt_next_session(update, context)
+            if report["status"] == "success":
+                # Move to next session
+                app_state["current_session_index"] += 1
+                await prompt_next_session(update, context)
+            else:
+                # Failure case - stay on current session and offer retry/skip/stop
+                app_state["failed_sessions"].append(report)
+                error_msg = f"❌ Session {session_id} failed: {escape_markdown(report.get('notes', 'Unknown error'))}\n\nWhat would you like to do?"
+                keyboard = [
+                    [
+                        InlineKeyboardButton("RETRY", callback_data=f"retry_{session_id}"),
+                        InlineKeyboardButton("SKIP", callback_data="proceed_skip"),
+                        InlineKeyboardButton("STOP", callback_data="proceed_stop")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.message.reply_text(error_msg, reply_markup=reply_markup)
             
         except Exception as e:
             logger.error(f"Error executing session {session_id}: {e}", exc_info=True)
@@ -149,7 +210,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             app_state["completed_sessions"].append(failed_report)
             
             # Ask user for action
-            error_msg = f"❌ Session {session_id} encountered an error: {str(e)[:100]}\n\nWhat would you like to do?"
+            error_msg = f"❌ Session {session_id} encountered a system error: {escape_markdown(str(e)[:100])}\n\nWhat would you like to do?"
             keyboard = [
                 [
                     InlineKeyboardButton("RETRY", callback_data=f"retry_{session_id}"),
@@ -169,40 +230,59 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             safety_messages = []
+            loop = asyncio.get_running_loop()
+            
             def safety_alert(msg):
                 safety_messages.append(msg)
+                asyncio.run_coroutine_threadsafe(
+                    query.message.reply_text(f"⚠️ **SAFETY ALERT**: {msg}"),
+                    loop
+                )
             
-            report = executor.execute_session(session, safety_callback=safety_alert, retry_on_failure=True)
+            report = await asyncio.to_thread(executor.execute_session, session, safety_callback=safety_alert, retry_on_failure=True)
             app_state["completed_sessions"].append(report)
             
             await send_session_report(query, report, safety_messages)
             
-            app_state["current_session_index"] += 1
-            await prompt_next_session(update, context)
+            if report["status"] == "success":
+                app_state["current_session_index"] += 1
+                await prompt_next_session(update, context)
+            else:
+                app_state["failed_sessions"].append(report)
+                error_msg = f"❌ Retry of Session {session_id} failed: {escape_markdown(report.get('notes', 'Unknown error'))}\n\nWhat would you like to do?"
+                keyboard = [
+                    [
+                        InlineKeyboardButton("RETRY", callback_data=f"retry_{session_id}"),
+                        InlineKeyboardButton("SKIP", callback_data="proceed_skip"),
+                        InlineKeyboardButton("STOP", callback_data="proceed_stop")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.message.reply_text(error_msg, reply_markup=reply_markup)
             
         except Exception as e:
-            await query.message.reply_text(f"❌ Retry failed: {str(e)[:100]}")
+            await query.message.reply_text(f"❌ Retry failed: {escape_markdown(str(e)[:100])}")
 
 async def send_session_report(query, report: dict, safety_messages: list = None):
     """Send detailed session execution report."""
     status_emoji = "✅" if report["status"] == "success" else "❌"
     
-    report_text = f"{status_emoji} **Session {report['session_id']} Report**\n"
-    report_text += f"Goal: {report['goal']}\n"
+    report_text = f"{status_emoji} **Session {escape_markdown(str(report['session_id']))} Report**\n"
+    report_text += f"Goal: {escape_markdown(report['goal'])}\n"
     report_text += f"Status: {report['status'].upper()}\n"
-    report_text += f"Notes: {report.get('notes', 'N/A')}\n\n"
+    report_text += f"Notes: {escape_markdown(report.get('notes', 'N/A'))}\n\n"
     
     if report["changes"]:
         report_text += "**Changes:**\n"
         for change in report["changes"][:10]:  # Limit to first 10 changes
-            report_text += f"  {change}\n"
+            report_text += f"  {escape_markdown(change)}\n"
         if len(report["changes"]) > 10:
             report_text += f"  ... and {len(report['changes']) - 10} more\n"
     
     if safety_messages:
         report_text += "\n⚠️ **Safety Alerts:**\n"
         for msg in safety_messages[:5]:
-            report_text += f"  • {msg}\n"
+            report_text += f"  • {escape_markdown(msg)}\n"
     
     if report.get("retry_count"):
         report_text += f"\n🔄 Retries: {report['retry_count']}\n"
@@ -232,13 +312,13 @@ async def send_final_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report += "**Completed Sessions:**\n"
         for session_report in app_state["completed_sessions"][:10]:
             status = "✅" if session_report["status"] == "success" else "❌"
-            report += f"  {status} [{session_report['session_id']}] {session_report['goal'][:50]}\n"
+            report += f"  {status} [{escape_markdown(str(session_report['session_id']))}] {escape_markdown(session_report['goal'][:50])}\n"
     
     if failed > 0:
         report += f"\n⚠️ **{failed} Session(s) Failed**\n"
         if app_state["failed_sessions"]:
             for failed_session in app_state["failed_sessions"][:3]:
-                report += f"  • Session {failed_session['session_id']}: {failed_session.get('error', 'Unknown error')[:50]}\n"
+                report += f"  • Session {escape_markdown(str(failed_session['session_id']))}: {escape_markdown(failed_session.get('error', 'Unknown error')[:50])}\n"
     
     report += "\n" + "="*50 + "\n"
     report += "✅ **All tasks completed!**\n\n"
@@ -247,7 +327,7 @@ async def send_final_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report += "  2. Test the modifications\n"
     report += "  3. Commit changes manually (no auto-push)\n"
     report += "  4. Push to GitHub when ready\n\n"
-    report += "📁 Workspace: `C:\\\\Users\\\\oshna\\\\Desktop\\\\REMOTE WORKSPACE`\n"
+    report += f"📁 Workspace: `{WORKSPACE_DIR}`\n"
     report += "📊 Logs: Check `logs/` directory for detailed execution logs\n"
     
     if update.message:
@@ -265,6 +345,7 @@ def run_bot():
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("stop", stop_workflow))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_callback))
     

@@ -27,8 +27,7 @@ def generate_session_plan(session: dict) -> dict:
                 logger.warning(f"Failed to read {file_path}: {e}")
                 files_context += f"\n--- {file_path} ---\n(Could not read: {str(e)})\n"
 
-    prompt = f"""You are an autonomous AI coding agent executing a development task.
-
+    prompt = f"""You are an autonomous AI coding agent.
 Session Goal: {session.get("goal")}
 Session Type: {session.get("type")}
 Target Files: {session.get("targets")}
@@ -36,24 +35,21 @@ Target Files: {session.get("targets")}
 Current file contents:
 {files_context}
 
-Generate a plan of executable steps. Return ONLY valid JSON:
+Output ONLY a valid JSON object with the following structure:
 {{
     "steps": [
         {{
-            "action": "read_file" or "write_file" or "run_command",
-            "path": "file path if applicable",
-            "content": "content if write_file",
-            "command": "command if run_command"
+            "action": "read_file" | "write_file" | "run_command",
+            "path": "path",
+            "content": "content",
+            "command": "command"
         }}
     ]
 }}
-
-Rules:
-- Only output JSON, no markdown or explanations
-- Action must be one of: read_file, write_file, run_command
-- Keep steps simple and atomic"""
+Rules: No markdown, no explanations, only valid JSON."""
 
     response_text = query_llm(prompt, json_format=True)
+    logger.debug(f"Raw LLM plan response: {response_text}")
     plan = _parse_plan_json(response_text)
     
     if not plan.get("steps"):
@@ -69,33 +65,55 @@ def _parse_plan_json(response_text: str) -> dict:
     
     response_text = response_text.strip()
     
+    def normalize_plan(data):
+        if isinstance(data, dict) and "steps" in data:
+            return data
+        if isinstance(data, list):
+            return {"steps": data}
+        return None
+
     # Strategy 1: Direct parse
     try:
         data = json.loads(response_text)
-        if isinstance(data, dict) and "steps" in data:
-            return data
+        result = normalize_plan(data)
+        if result: return result
     except json.JSONDecodeError:
         pass
     
-    # Strategy 2: Remove markdown code blocks
+    # Strategy 2: Extract from markdown code blocks
     try:
-        cleaned = response_text.strip()
-        if "```" in cleaned:
-            cleaned = re.sub(r'```(?:json)?\s*', '', cleaned)
-        data = json.loads(cleaned)
-        if isinstance(data, dict) and "steps" in data:
-            return data
-    except json.JSONDecodeError:
+        matches = re.findall(r'```(?:json)?\s*(.*?)\s*```', response_text, re.DOTALL)
+        for match in matches:
+            try:
+                data = json.loads(match)
+                result = normalize_plan(data)
+                if result: return result
+            except json.JSONDecodeError:
+                continue
+    except Exception:
         pass
     
-    # Strategy 3: Extract JSON object
+    # Strategy 3: Extract JSON object or array
     try:
-        match = re.search(r'{.*"steps".*}', response_text, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict) and "steps" in data:
-                return data
-    except (json.JSONDecodeError, AttributeError):
+        # Try object first
+        obj_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if obj_match:
+            try:
+                data = json.loads(obj_match.group(0))
+                result = normalize_plan(data)
+                if result: return result
+            except json.JSONDecodeError:
+                pass
+        
+        # Try array
+        array_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if array_match:
+            try:
+                data = json.loads(array_match.group(0))
+                if isinstance(data, list): return {"steps": data}
+            except json.JSONDecodeError:
+                pass
+    except Exception:
         pass
     
     logger.warning(f"All plan parsing strategies failed")

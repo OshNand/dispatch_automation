@@ -27,7 +27,7 @@ class Config(BaseModel):
 
     # Ollama settings
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 
     # Safety thresholds
     CPU_CRITICAL_PERCENT: float = 95.0

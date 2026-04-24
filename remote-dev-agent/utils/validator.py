@@ -33,12 +33,12 @@ class Validator:
         Returns True if valid, raises ValidationError if not.
         """
         try:
-            # Normalize path
-            safe_path = Path(filepath).resolve()
+            # Resolve relative to workspace
+            full_path = (WORKSPACE_DIR / filepath).resolve()
             workspace_resolved = WORKSPACE_DIR.resolve()
             
             # Check if path is within workspace
-            if not str(safe_path).startswith(str(workspace_resolved)):
+            if not str(full_path).startswith(str(workspace_resolved)):
                 raise ValidationError(f"Path traversal detected: {filepath}")
             
             # Check for null bytes

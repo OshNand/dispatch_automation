@@ -1,0 +1,20 @@
+{
+  "session_id": 1,
+  "goal": "Review prompt",
+  "start_time": "2026-04-24T18:42:07.179815",
+  "end_time": "2026-04-24T18:42:11.333812",
+  "status": "success",
+  "steps": [
+    {
+      "timestamp": "2026-04-24T18:42:07.181026",
+      "action": "validation",
+      "details": {
+        "status": "passed"
+      },
+      "status": "success"
+    }
+  ],
+  "error": null,
+  "warnings": [],
+  "summary": "Planner generated no steps for this session."
+}

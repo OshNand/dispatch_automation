@@ -41,6 +41,7 @@ IMPORTANT RULES:
 - No markdown, no explanations, only JSON"""
 
     response_text = query_llm(prompt, json_format=True)
+    logger.debug(f"Raw LLM response: {response_text}")
     sessions = _parse_json_response(response_text)
     
     if not sessions:
@@ -57,37 +58,61 @@ def _parse_json_response(response_text: str) -> list:
     
     response_text = response_text.strip()
     
+    def normalize_data(data):
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Case 1: Wrapped in "sessions" key
+            if "sessions" in data and isinstance(data["sessions"], list):
+                return data["sessions"]
+            # Case 2: Single session object
+            if "goal" in data and "id" in data:
+                return [data]
+        return []
+
     # Strategy 1: Direct parse
     try:
         data = json.loads(response_text)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and "sessions" in data:
-            return data.get("sessions", []) if isinstance(data.get("sessions"), list) else []
+        result = normalize_data(data)
+        if result: return result
     except json.JSONDecodeError:
         pass
     
-    # Strategy 2: Remove markdown code blocks
+    # Strategy 2: Extract from markdown code blocks
     try:
-        cleaned = response_text.strip()
-        if "```" in cleaned:
-            cleaned = re.sub(r'```(?:json)?\s*', '', cleaned)
-        data = json.loads(cleaned)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and "sessions" in data:
-            return data.get("sessions", [])
-    except json.JSONDecodeError:
+        matches = re.findall(r'```(?:json)?\s*(.*?)\s*```', response_text, re.DOTALL)
+        for match in matches:
+            try:
+                data = json.loads(match)
+                result = normalize_data(data)
+                if result: return result
+            except json.JSONDecodeError:
+                continue
+    except Exception:
         pass
     
-    # Strategy 3: Extract JSON array
+    # Strategy 3: Extract first JSON array or object
     try:
-        match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, AttributeError):
+        # Try array first
+        array_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if array_match:
+            try:
+                data = json.loads(array_match.group(0))
+                if isinstance(data, list): return data
+            except json.JSONDecodeError:
+                pass
+        
+        # Try object
+        obj_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if obj_match:
+            try:
+                data = json.loads(obj_match.group(0))
+                result = normalize_data(data)
+                if result: return result
+            except json.JSONDecodeError:
+                pass
+    except Exception:
         pass
     
-    logger.warning(f"JSON parsing failed, trying fallback")
+    logger.warning(f"JSON parsing failed for response: {response_text[:200]}...")
     return []
