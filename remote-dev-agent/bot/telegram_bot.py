@@ -1,11 +1,13 @@
 import logging
 import json
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from config.settings import settings
 from monitor.system_monitor import format_system_status
 from reasoning.translator import translate_prompt_to_sessions
-from agent.execution_engine import execute_session
+from agent.execution_engine import executor
+from utils import execution_logger
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +15,10 @@ logger = logging.getLogger(__name__)
 app_state = {
     "sessions": [],
     "current_session_index": 0,
-    "completed_sessions": []
+    "completed_sessions": [],
+    "paused": False,
+    "user_context": None,
+    "failed_sessions": []
 }
 
 def is_allowed(update: Update) -> bool:
@@ -85,53 +90,165 @@ async def prompt_next_session(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button presses for session approval/skip/stop."""
     query = update.callback_query
     await query.answer()
     
     data = query.data
     
     if data == "proceed_stop":
-        await query.edit_message_text(text="🛑 Execution stopped by user.")
+        await query.edit_message_text(text="🛑 Execution stopped by user. Review completed sessions below.")
+        await send_final_report(update, context)
         return
-        
+    
     if data == "proceed_skip":
+        session = app_state["sessions"][app_state["current_session_index"]]
         app_state["current_session_index"] += 1
-        await query.edit_message_text(text="⏭️ Session skipped.")
+        await query.edit_message_text(text=f"⏭️ Session {session.get('id')} skipped.")
         await prompt_next_session(update, context)
         return
-        
+    
     if data == "proceed_yes":
         session = app_state["sessions"][app_state["current_session_index"]]
-        await query.edit_message_text(text=f"⚙️ Executing Session {session.get('id')}...")
+        session_id = session.get("id")
         
-        # Async wrapper to send safety alerts if they happen during execution
-        def safety_alert(msg):
-            # This is synchronous but called from sync code. 
-            # In a full async app, we'd use a queue. For now, logging will catch it.
-            logger.warning(msg)
+        await query.edit_message_text(text=f"⚙️ Executing Session {session_id}... (This may take a while)")
+        
+        try:
+            # Create a callback for safety alerts during execution
+            safety_messages = []
+            def safety_alert(msg):
+                safety_messages.append(msg)
+                logger.warning(f"SAFETY ALERT: {msg}")
             
-        report = execute_session(session, safety_callback=safety_alert)
-        app_state["completed_sessions"].append(report)
+            # Execute the session with error handling and retry support
+            report = executor.execute_session(session, safety_callback=safety_alert)
+            
+            # Store completed session
+            app_state["completed_sessions"].append(report)
+            
+            # Send detailed report
+            await send_session_report(query, report, safety_messages)
+            
+            # Move to next session
+            app_state["current_session_index"] += 1
+            await prompt_next_session(update, context)
+            
+        except Exception as e:
+            logger.error(f"Error executing session {session_id}: {e}", exc_info=True)
+            
+            # Store failed session
+            failed_report = {
+                "session_id": session_id,
+                "goal": session.get("goal"),
+                "status": "error",
+                "error": str(e),
+                "changes": []
+            }
+            app_state["failed_sessions"].append(failed_report)
+            app_state["completed_sessions"].append(failed_report)
+            
+            # Ask user for action
+            error_msg = f"❌ Session {session_id} encountered an error: {str(e)[:100]}\n\nWhat would you like to do?"
+            keyboard = [
+                [
+                    InlineKeyboardButton("RETRY", callback_data=f"retry_{session_id}"),
+                    InlineKeyboardButton("SKIP", callback_data="proceed_skip"),
+                    InlineKeyboardButton("STOP", callback_data="proceed_stop")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text(error_msg, reply_markup=reply_markup)
+    
+    # Retry logic
+    if data.startswith("retry_"):
+        session = app_state["sessions"][app_state["current_session_index"]]
+        session_id = session.get("id")
         
-        report_text = f"📊 **Session {report['session_id']} Report**\n"
-        report_text += f"Status: {report['status']}\n"
-        report_text += f"Notes: {report['notes']}\n"
-        report_text += "Changes:\n" + "\n".join([f"- {c}" for c in report['changes']])
+        await query.edit_message_text(text=f"🔄 Retrying Session {session_id}...")
         
-        await query.message.reply_text(report_text, parse_mode="Markdown")
-        
-        app_state["current_session_index"] += 1
-        await prompt_next_session(update, context)
+        try:
+            safety_messages = []
+            def safety_alert(msg):
+                safety_messages.append(msg)
+            
+            report = executor.execute_session(session, safety_callback=safety_alert, retry_on_failure=True)
+            app_state["completed_sessions"].append(report)
+            
+            await send_session_report(query, report, safety_messages)
+            
+            app_state["current_session_index"] += 1
+            await prompt_next_session(update, context)
+            
+        except Exception as e:
+            await query.message.reply_text(f"❌ Retry failed: {str(e)[:100]}")
+
+async def send_session_report(query, report: dict, safety_messages: list = None):
+    """Send detailed session execution report."""
+    status_emoji = "✅" if report["status"] == "success" else "❌"
+    
+    report_text = f"{status_emoji} **Session {report['session_id']} Report**\n"
+    report_text += f"Goal: {report['goal']}\n"
+    report_text += f"Status: {report['status'].upper()}\n"
+    report_text += f"Notes: {report.get('notes', 'N/A')}\n\n"
+    
+    if report["changes"]:
+        report_text += "**Changes:**\n"
+        for change in report["changes"][:10]:  # Limit to first 10 changes
+            report_text += f"  {change}\n"
+        if len(report["changes"]) > 10:
+            report_text += f"  ... and {len(report['changes']) - 10} more\n"
+    
+    if safety_messages:
+        report_text += "\n⚠️ **Safety Alerts:**\n"
+        for msg in safety_messages[:5]:
+            report_text += f"  • {msg}\n"
+    
+    if report.get("retry_count"):
+        report_text += f"\n🔄 Retries: {report['retry_count']}\n"
+    
+    await query.message.reply_text(report_text, parse_mode="Markdown")
 
 async def send_final_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and send comprehensive final execution report."""
     total = len(app_state["sessions"])
+    completed = len(app_state["completed_sessions"])
     success = sum(1 for r in app_state["completed_sessions"] if r["status"] == "success")
+    failed = len(app_state["failed_sessions"])
+    skipped = total - completed
+    
+    # Get execution summary from logger
+    exec_summary = execution_logger.generate_execution_summary()
     
     report = "📈 **FINAL EXECUTION REPORT**\n\n"
-    report += f"Total Sessions: {total}\n"
-    report += f"Successful: {success}\n"
-    report += f"Failed/Skipped: {total - success}\n\n"
-    report += "All tasks completed. Check your workspace and review before git push."
+    report += f"**Summary:**\n"
+    report += f"  Total Sessions: {total}\n"
+    report += f"  ✅ Successful: {success}\n"
+    report += f"  ❌ Failed: {failed}\n"
+    report += f"  ⏭️ Skipped: {skipped}\n"
+    report += f"  ⚙️ Executed: {completed}\n\n"
+    
+    if app_state["completed_sessions"]:
+        report += "**Completed Sessions:**\n"
+        for session_report in app_state["completed_sessions"][:10]:
+            status = "✅" if session_report["status"] == "success" else "❌"
+            report += f"  {status} [{session_report['session_id']}] {session_report['goal'][:50]}\n"
+    
+    if failed > 0:
+        report += f"\n⚠️ **{failed} Session(s) Failed**\n"
+        if app_state["failed_sessions"]:
+            for failed_session in app_state["failed_sessions"][:3]:
+                report += f"  • Session {failed_session['session_id']}: {failed_session.get('error', 'Unknown error')[:50]}\n"
+    
+    report += "\n" + "="*50 + "\n"
+    report += "✅ **All tasks completed!**\n\n"
+    report += "📋 **Next Steps:**\n"
+    report += "  1. Review changes in your workspace\n"
+    report += "  2. Test the modifications\n"
+    report += "  3. Commit changes manually (no auto-push)\n"
+    report += "  4. Push to GitHub when ready\n\n"
+    report += "📁 Workspace: `C:\\\\Users\\\\oshna\\\\Desktop\\\\REMOTE WORKSPACE`\n"
+    report += "📊 Logs: Check `logs/` directory for detailed execution logs\n"
     
     if update.message:
         await update.message.reply_text(report, parse_mode="Markdown")

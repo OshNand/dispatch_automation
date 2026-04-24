@@ -1,23 +1,26 @@
 import subprocess
+import logging
 import shlex
 from config.settings import WORKSPACE_DIR
+
+logger = logging.getLogger(__name__)
 
 def run_command(command: str, timeout: int = 60) -> str:
     """
     Runs a shell command safely in the workspace.
-    Restricts potentially destructive commands in a basic way.
+    Validates command before execution.
     """
-    # Very basic safety check
-    forbidden = ["rm -rf /", "mkfs", "dd"]
-    for f in forbidden:
-        if f in command:
-            return f"Error: Command contains forbidden pattern: {f}"
+    try:
+        from utils import validator
+        validator.validate_command(command)
+    except Exception as e:
+        error_msg = f"Command validation failed: {e}"
+        logger.error(error_msg)
+        return error_msg
 
     try:
-        # Use shlex to split for safe execution (not using shell=True unless necessary)
-        # Note: on Windows we might need shell=True for some built-ins, but for cross-platform
-        # subprocess.run with a string and shell=True is easiest, though risky.
-        # Given it's a local agent, we allow shell=True but run it in WORKSPACE_DIR
+        logger.info(f"Executing command: {command[:100]}...")
+        
         result = subprocess.run(
             command,
             cwd=WORKSPACE_DIR,
@@ -30,12 +33,19 @@ def run_command(command: str, timeout: int = 60) -> str:
         output = result.stdout
         if result.stderr:
             output += f"\n[STDERR]\n{result.stderr}"
-            
-        return output if output else "Command executed successfully with no output."
+        
+        success_msg = output if output else "Command executed successfully with no output."
+        logger.info(f"Command executed successfully")
+        return success_msg
+        
     except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds."
+        error_msg = f"Error: Command timed out after {timeout} seconds."
+        logger.error(error_msg)
+        return error_msg
     except Exception as e:
-        return f"Error executing command: {str(e)}"
+        error_msg = f"Error executing command: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
 
 def run_tests(test_command: str = "pytest") -> str:
     """Runs tests in the workspace."""
